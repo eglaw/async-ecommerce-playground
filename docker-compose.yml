@@ -1,0 +1,80 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: app
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+
+  rabbitmq:
+    image: rabbitmq:3.9.7-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: app
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 5
+
+  go-orders:
+    build: ./services/orders-api
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/app?sslmode=disable
+      AMQP_URL: amqp://app:app@rabbitmq:5672/
+      HTTP_ADDR: :8080
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  cpp-worker:
+    build: ./services/order-worker
+    environment:
+      AMQP_URL: amqp://app:app@rabbitmq:5672/
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      go-orders:
+        condition: service_started
+    deploy:
+      replicas: 2
+
+  web:
+    build: ./services/web
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/app
+      ORDERS_API_URL: http://go-orders:8080
+      SESSION_SECRET: change-me-in-production-use-long-random-string
+    ports:
+      - "3000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      go-orders:
+        condition: service_healthy
+
+volumes:
+  pgdata:
