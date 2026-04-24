@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	amqp "github.com/rabbitmq/amqp091-go"
 )
@@ -50,9 +51,101 @@ type statusMessage struct {
 	Detail  string `json:"detail,omitempty"`
 }
 
+type orderPayload struct {
+	Items []orderItem `json:"items"`
+}
+
 type appState struct {
 	pool *pgxpool.Pool
 	ch   *amqp.Channel
+}
+
+func truncateStatusDetail(d string) string {
+	if len(d) > 120 {
+		return d[:120] + "…"
+	}
+	return d
+}
+
+func (a *appState) applyShippedDecrementStock(ctx context.Context, m statusMessage) error {
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("status consumer: begin tx order=%s: %v", m.OrderID, err)
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var curStatus string
+	var payload json.RawMessage
+	err = tx.QueryRow(ctx,
+		`SELECT status, payload FROM orders WHERE id = $1::uuid FOR UPDATE`,
+		m.OrderID,
+	).Scan(&curStatus, &payload)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("status consumer: no row for order=%s (shipped)", m.OrderID)
+			return fmt.Errorf("order not found: %s", m.OrderID)
+		}
+		log.Printf("status consumer: select order=%s: %v", m.OrderID, err)
+		return err
+	}
+	curStatus = strings.ToLower(strings.TrimSpace(curStatus))
+	if curStatus == "shipped" {
+		if err := tx.Commit(ctx); err != nil {
+			log.Printf("status consumer: commit idempotent order=%s: %v", m.OrderID, err)
+			return err
+		}
+		log.Printf("status consumer: order=%s already shipped (idempotent)", m.OrderID)
+		return nil
+	}
+
+	var p orderPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("order %s: parse payload: %w", m.OrderID, err)
+	}
+	if len(p.Items) == 0 {
+		return fmt.Errorf("order %s: empty items in payload", m.OrderID)
+	}
+
+	for _, it := range p.Items {
+		if it.ProductID < 1 || it.Qty < 1 {
+			return fmt.Errorf("order %s: invalid line item product_id=%d qty=%d", m.OrderID, it.ProductID, it.Qty)
+		}
+		tag, err := tx.Exec(ctx,
+			`UPDATE products SET stock = stock - $2 WHERE id = $1 AND stock >= $2`,
+			it.ProductID, it.Qty,
+		)
+		if err != nil {
+			log.Printf("status consumer: stock update order=%s product=%d: %v", m.OrderID, it.ProductID, err)
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			log.Printf("status consumer: stock update order=%s product=%d qty=%d: missing product or insufficient stock",
+				m.OrderID, it.ProductID, it.Qty)
+			return fmt.Errorf("order %s: stock update failed for product_id=%d qty=%d", m.OrderID, it.ProductID, it.Qty)
+		}
+	}
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE orders SET status = 'shipped', updated_at = NOW() WHERE id = $1::uuid`,
+		m.OrderID,
+	)
+	if err != nil {
+		log.Printf("status consumer: set shipped order=%s: %v", m.OrderID, err)
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("order %s: update shipped affected %d rows", m.OrderID, tag.RowsAffected())
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("status consumer: commit order=%s: %v", m.OrderID, err)
+		return err
+	}
+
+	detail := truncateStatusDetail(m.Detail)
+	log.Printf("status consumer: order=%s -> shipped (%s); stock decremented", m.OrderID, detail)
+	return nil
 }
 
 func (a *appState) applyStatusUpdate(body []byte) error {
@@ -70,6 +163,11 @@ func (a *appState) applyStatusUpdate(body []byte) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+
+	if status == "shipped" {
+		return a.applyShippedDecrementStock(ctx, m)
+	}
+
 	tag, err := a.pool.Exec(ctx,
 		`UPDATE orders SET status = $2, updated_at = NOW() WHERE id = $1::uuid`,
 		m.OrderID, status,
@@ -82,10 +180,7 @@ func (a *appState) applyStatusUpdate(body []byte) error {
 		log.Printf("status consumer: no row for order=%s (status=%s)", m.OrderID, status)
 		return fmt.Errorf("order not found: %s", m.OrderID)
 	}
-	detail := m.Detail
-	if len(detail) > 120 {
-		detail = detail[:120] + "…"
-	}
+	detail := truncateStatusDetail(m.Detail)
 	log.Printf("status consumer: order=%s -> %s (%s)", m.OrderID, status, detail)
 	return nil
 }
