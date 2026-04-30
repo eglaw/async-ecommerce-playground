@@ -1,4 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 
 type Product = {
   id: number;
@@ -15,18 +20,36 @@ type CartLine = {
   qty: number;
 };
 
-type OrderStatus = {
+type OrderItemRow = {
+  product_id: number;
+  name: string;
+  qty: number;
+  price_cents: number;
+};
+
+type OrderDetail = {
   id: string;
+  session_id: string;
   status: string;
+  payload: { items?: OrderItemRow[] };
   created_at: string;
   updated_at: string;
 };
+
+type WsOrderUpdate = { type: "order_update"; order: OrderDetail };
+type WsCatalogChanged = { type: "catalog_changed" };
+type WsMessage = WsOrderUpdate | WsCatalogChanged;
 
 function formatPrice(cents: number) {
   return new Intl.NumberFormat(undefined, {
     style: "currency",
     currency: "USD",
   }).format(cents / 100);
+}
+
+function wsBaseUrl(): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}`;
 }
 
 export default function App() {
@@ -36,7 +59,29 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [checkoutLoading, setCheckoutLoading] = useState(false);
   const [activeOrderId, setActiveOrderId] = useState<string | null>(null);
-  const [orderStatus, setOrderStatus] = useState<OrderStatus | null>(null);
+  const [orderStatus, setOrderStatus] = useState<OrderDetail | null>(null);
+  const [shippedModal, setShippedModal] = useState<OrderDetail | null>(null);
+
+  const activeOrderIdRef = useRef<string | null>(null);
+  const prevStatusRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    activeOrderIdRef.current = activeOrderId;
+  }, [activeOrderId]);
+
+  useEffect(() => {
+    if (!activeOrderId) {
+      prevStatusRef.current = null;
+      return;
+    }
+    const st = orderStatus?.status?.toLowerCase().trim();
+    if (st === undefined) return;
+    const prev = prevStatusRef.current;
+    if (prev !== "shipped" && st === "shipped") {
+      setShippedModal(orderStatus);
+    }
+    prevStatusRef.current = st;
+  }, [orderStatus, activeOrderId]);
 
   const loadProducts = useCallback(async () => {
     const r = await fetch("/api/products", { credentials: "include" });
@@ -48,6 +93,19 @@ export default function App() {
     const r = await fetch("/api/cart", { credentials: "include" });
     if (!r.ok) throw new Error(await r.text());
     setCart(await r.json());
+  }, []);
+
+  const fetchOrderSnapshot = useCallback(async (orderId: string) => {
+    try {
+      const r = await fetch(`/api/orders/${orderId}`, {
+        credentials: "include",
+      });
+      if (!r.ok) return;
+      const data = (await r.json()) as OrderDetail;
+      setOrderStatus(data);
+    } catch {
+      /* ignore */
+    }
   }, []);
 
   const refresh = useCallback(async () => {
@@ -67,30 +125,44 @@ export default function App() {
   }, [refresh]);
 
   useEffect(() => {
-    if (!activeOrderId) {
-      setOrderStatus(null);
+    let ws: WebSocket | null = null;
+    try {
+      ws = new WebSocket(`${wsBaseUrl()}/ws`);
+    } catch {
       return;
     }
-    let cancelled = false;
-    const tick = async () => {
+
+    ws.onmessage = (ev) => {
+      let msg: WsMessage;
       try {
-        const r = await fetch(`/api/orders/${activeOrderId}`, {
-          credentials: "include",
-        });
-        if (!r.ok) return;
-        const data = (await r.json()) as OrderStatus;
-        if (!cancelled) setOrderStatus(data);
+        msg = JSON.parse(ev.data as string) as WsMessage;
       } catch {
-        /* ignore poll errors */
+        return;
+      }
+      if (msg.type === "catalog_changed") {
+        void loadProducts();
+        return;
+      }
+      if (msg.type === "order_update") {
+        if (msg.order.id === activeOrderIdRef.current) {
+          setOrderStatus(msg.order);
+        }
       }
     };
-    void tick();
-    const id = window.setInterval(tick, 1500);
+
     return () => {
-      cancelled = true;
-      window.clearInterval(id);
+      ws?.close();
     };
-  }, [activeOrderId]);
+  }, [loadProducts]);
+
+  useEffect(() => {
+    if (!activeOrderId) {
+      setOrderStatus(null);
+      prevStatusRef.current = null;
+      return;
+    }
+    void fetchOrderSnapshot(activeOrderId);
+  }, [activeOrderId, fetchOrderSnapshot]);
 
   async function addToCart(product: Product) {
     setError(null);
@@ -125,6 +197,7 @@ export default function App() {
     setCheckoutLoading(true);
     setActiveOrderId(null);
     setOrderStatus(null);
+    prevStatusRef.current = null;
     try {
       const r = await fetch("/api/checkout", {
         method: "POST",
@@ -143,6 +216,7 @@ export default function App() {
       setActiveOrderId(id);
       await loadCart();
       await loadProducts();
+      await fetchOrderSnapshot(id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "checkout failed");
     } finally {
@@ -154,6 +228,8 @@ export default function App() {
     (sum, l) => sum + l.price_cents * l.qty,
     0
   );
+
+  const modalItems = shippedModal?.payload?.items ?? [];
 
   return (
     <main>
@@ -234,10 +310,57 @@ export default function App() {
                 <span className="badge">{orderStatus.status}</span>
               </p>
               <p className="muted">
-                Updated: {new Date(orderStatus.updated_at).toLocaleString()}
+                Updated:{" "}
+                {new Date(orderStatus.updated_at).toLocaleString()}
               </p>
             </>
           )}
+        </div>
+      ) : null}
+
+      {shippedModal ? (
+        <div
+          className="modal-backdrop"
+          role="presentation"
+          onClick={() => setShippedModal(null)}
+        >
+          <div
+            className="modal-dialog"
+            role="dialog"
+            aria-labelledby="shipped-modal-title"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 id="shipped-modal-title">Order shipped</h2>
+            <p className="muted modal-order-id">{shippedModal.id}</p>
+            <p style={{ marginTop: "0.75rem" }}>
+              Placed{" "}
+              {new Date(shippedModal.created_at).toLocaleString()} · Updated{" "}
+              {new Date(shippedModal.updated_at).toLocaleString()}
+            </p>
+            <h3 style={{ margin: "1rem 0 0.5rem", fontSize: "1rem" }}>
+              Items
+            </h3>
+            {modalItems.length === 0 ? (
+              <p className="muted">No line items in payload.</p>
+            ) : (
+              <ul className="modal-items">
+                {modalItems.map((it) => (
+                  <li key={`${it.product_id}-${it.name}`}>
+                    <span>{it.name}</span>
+                    <span className="muted">
+                      × {it.qty} ({formatPrice(it.price_cents * it.qty)})
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="modal-actions row">
+              <button type="button" onClick={() => setShippedModal(null)}>
+                Close
+              </button>
+            </div>
+          </div>
         </div>
       ) : null}
     </main>

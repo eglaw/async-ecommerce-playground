@@ -36,6 +36,8 @@ services:
       DATABASE_URL: postgres://app:app@postgres:5432/app?sslmode=disable
       AMQP_URL: amqp://app:app@rabbitmq:5672/
       HTTP_ADDR: :8080
+      BFF_NOTIFY_URL: http://web:8000/internal/order-events
+      INTERNAL_EVENTS_SECRET: dev-internal-events-secret
     ports:
       - "8080:8080"
     healthcheck:
@@ -68,6 +70,7 @@ services:
       DATABASE_URL: postgres://app:app@postgres:5432/app
       ORDERS_API_URL: http://go-orders:8080
       SESSION_SECRET: change-me-in-production-use-long-random-string
+      INTERNAL_EVENTS_SECRET: dev-internal-events-secret
     ports:
       - "3000:8000"
     depends_on:

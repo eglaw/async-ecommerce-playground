@@ -2,12 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+func parseStatusMessage(body []byte) (statusMessage, error) {
+	var m statusMessage
+	err := json.Unmarshal(body, &m)
+	return m, err
+}
 
 const (
 	exchangeName   = "orders.events"
@@ -91,10 +98,17 @@ func consumeStatusLoop(ch *amqp.Channel, app *appState) {
 	for d := range msgs {
 		log.Printf("status consumer: delivery tag=%d body=%dB exchange=%q route=%q",
 			d.DeliveryTag, len(d.Body), d.Exchange, d.RoutingKey)
+		var notifyID string
+		if m, err := parseStatusMessage(d.Body); err == nil {
+			notifyID = m.OrderID
+		}
 		if err := app.applyStatusUpdate(d.Body); err != nil {
 			log.Printf("status consumer: apply failed, nack+requeue: %v", err)
 			_ = d.Nack(false, true)
 			continue
+		}
+		if notifyID != "" {
+			go notifyBFF(notifyID)
 		}
 		if err := d.Ack(false); err != nil {
 			log.Printf("status consumer: ack error: %v", err)
