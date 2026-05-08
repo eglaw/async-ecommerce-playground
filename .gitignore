@@ -1,8 +1,16 @@
-
+# IDEs
 .idea
 .vscode
 
-vendor
+
+# Docker
+.docker
+
+# virtuals
 venv
 
+# Vendors
+vendor
+
+# env files
 .env
