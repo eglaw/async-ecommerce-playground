@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -67,7 +68,7 @@ func truncateStatusDetail(d string) string {
 	return d
 }
 
-func (a *appState) applyShippedDecrementStock(ctx context.Context, m statusMessage) error {
+func (a *appState) applyShipped(ctx context.Context, m statusMessage) error {
 	tx, err := a.pool.Begin(ctx)
 	if err != nil {
 		log.Printf("status consumer: begin tx order=%s: %v", m.OrderID, err)
@@ -106,23 +107,9 @@ func (a *appState) applyShippedDecrementStock(ctx context.Context, m statusMessa
 	if len(p.Items) == 0 {
 		return fmt.Errorf("order %s: empty items in payload", m.OrderID)
 	}
-
 	for _, it := range p.Items {
 		if it.ProductID < 1 || it.Qty < 1 {
 			return fmt.Errorf("order %s: invalid line item product_id=%d qty=%d", m.OrderID, it.ProductID, it.Qty)
-		}
-		tag, err := tx.Exec(ctx,
-			`UPDATE products SET stock = stock - $2 WHERE id = $1 AND stock >= $2`,
-			it.ProductID, it.Qty,
-		)
-		if err != nil {
-			log.Printf("status consumer: stock update order=%s product=%d: %v", m.OrderID, it.ProductID, err)
-			return err
-		}
-		if tag.RowsAffected() != 1 {
-			log.Printf("status consumer: stock update order=%s product=%d qty=%d: missing product or insufficient stock",
-				m.OrderID, it.ProductID, it.Qty)
-			return fmt.Errorf("order %s: stock update failed for product_id=%d qty=%d", m.OrderID, it.ProductID, it.Qty)
 		}
 	}
 
@@ -144,7 +131,91 @@ func (a *appState) applyShippedDecrementStock(ctx context.Context, m statusMessa
 	}
 
 	detail := truncateStatusDetail(m.Detail)
-	log.Printf("status consumer: order=%s -> shipped (%s); stock decremented", m.OrderID, detail)
+	log.Printf("status consumer: order=%s -> shipped (%s)", m.OrderID, detail)
+	return nil
+}
+
+func (a *appState) applyFailedRestoreStock(ctx context.Context, m statusMessage) error {
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("status consumer: begin tx order=%s: %v", m.OrderID, err)
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var curStatus string
+	var payload json.RawMessage
+	err = tx.QueryRow(ctx,
+		`SELECT status, payload FROM orders WHERE id = $1::uuid FOR UPDATE`,
+		m.OrderID,
+	).Scan(&curStatus, &payload)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("status consumer: no row for order=%s (failed)", m.OrderID)
+			return fmt.Errorf("order not found: %s", m.OrderID)
+		}
+		log.Printf("status consumer: select order=%s: %v", m.OrderID, err)
+		return err
+	}
+	curStatus = strings.ToLower(strings.TrimSpace(curStatus))
+	if curStatus == "failed" {
+		if err := tx.Commit(ctx); err != nil {
+			log.Printf("status consumer: commit idempotent failed order=%s: %v", m.OrderID, err)
+			return err
+		}
+		log.Printf("status consumer: order=%s already failed (idempotent)", m.OrderID)
+		return nil
+	}
+
+	var p orderPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return fmt.Errorf("order %s: parse payload: %w", m.OrderID, err)
+	}
+	if len(p.Items) == 0 {
+		return fmt.Errorf("order %s: empty items in payload", m.OrderID)
+	}
+
+	// Stock was decremented at order creation; restore only when order had not shipped.
+	if curStatus != "shipped" {
+		lines := append([]orderItem(nil), p.Items...)
+		sort.Slice(lines, func(i, j int) bool { return lines[i].ProductID < lines[j].ProductID })
+		for _, it := range lines {
+			if it.ProductID < 1 || it.Qty < 1 {
+				return fmt.Errorf("order %s: invalid line item product_id=%d qty=%d", m.OrderID, it.ProductID, it.Qty)
+			}
+			tag, err := tx.Exec(ctx,
+				`UPDATE products SET stock = stock + $2 WHERE id = $1`,
+				it.ProductID, it.Qty,
+			)
+			if err != nil {
+				log.Printf("status consumer: stock restore order=%s product=%d: %v", m.OrderID, it.ProductID, err)
+				return err
+			}
+			if tag.RowsAffected() != 1 {
+				log.Printf("status consumer: stock restore order=%s product=%d: missing product", m.OrderID, it.ProductID)
+				return fmt.Errorf("order %s: stock restore failed for product_id=%d", m.OrderID, it.ProductID)
+			}
+		}
+	}
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE orders SET status = 'failed', updated_at = NOW() WHERE id = $1::uuid`,
+		m.OrderID,
+	)
+	if err != nil {
+		log.Printf("status consumer: set failed order=%s: %v", m.OrderID, err)
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("order %s: update failed affected %d rows", m.OrderID, tag.RowsAffected())
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("status consumer: commit failed order=%s: %v", m.OrderID, err)
+		return err
+	}
+	detail := truncateStatusDetail(m.Detail)
+	log.Printf("status consumer: order=%s -> failed (%s)", m.OrderID, detail)
 	return nil
 }
 
@@ -164,8 +235,13 @@ func (a *appState) applyStatusUpdate(body []byte) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if status == "shipped" {
-		return a.applyShippedDecrementStock(ctx, m)
+	switch status {
+	case "shipped":
+		return a.applyShipped(ctx, m)
+	case "failed":
+		return a.applyFailedRestoreStock(ctx, m)
+	case "processing":
+		// handled below
 	}
 
 	tag, err := a.pool.Exec(ctx,
@@ -286,6 +362,14 @@ func (a *appState) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("POST /orders: session_id=%s items=%d remote=%s", req.SessionID, len(req.Items), r.RemoteAddr)
 
+	for _, it := range req.Items {
+		if it.ProductID < 1 || it.Qty < 1 {
+			log.Printf("POST /orders: invalid line item product_id=%d qty=%d", it.ProductID, it.Qty)
+			http.Error(w, "invalid line item", http.StatusBadRequest)
+			return
+		}
+	}
+
 	payload, err := json.Marshal(map[string]any{
 		"items": req.Items,
 	})
@@ -294,11 +378,49 @@ func (a *appState) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	lines := append([]orderItem(nil), req.Items...)
+	sort.Slice(lines, func(i, j int) bool { return lines[i].ProductID < lines[j].ProductID })
+
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 	defer cancel()
 
+	tx, err := a.pool.Begin(ctx)
+	if err != nil {
+		log.Printf("POST /orders: begin tx: %v", err)
+		http.Error(w, "could not create order", http.StatusInternalServerError)
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	var failPID int
+	for _, it := range lines {
+		tag, err := tx.Exec(ctx,
+			`UPDATE products SET stock = stock - $2 WHERE id = $1 AND stock >= $2`,
+			it.ProductID, it.Qty,
+		)
+		if err != nil {
+			log.Printf("POST /orders: stock update product=%d: %v", it.ProductID, err)
+			http.Error(w, "could not create order", http.StatusInternalServerError)
+			return
+		}
+		if tag.RowsAffected() != 1 {
+			failPID = it.ProductID
+			break
+		}
+	}
+	if failPID != 0 {
+		log.Printf("POST /orders: insufficient stock for product_id=%d session=%s", failPID, req.SessionID)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":      "insufficient_stock",
+			"product_id": failPID,
+		})
+		return
+	}
+
 	var orderID string
-	err = a.pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO orders (id, session_id, status, payload)
 		VALUES (gen_random_uuid(), $1, 'pending', $2::jsonb)
 		RETURNING id::text`,
@@ -306,6 +428,11 @@ func (a *appState) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 	).Scan(&orderID)
 	if err != nil {
 		log.Printf("insert order failed: %v", err)
+		http.Error(w, "could not create order", http.StatusInternalServerError)
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("POST /orders: commit: %v", err)
 		http.Error(w, "could not create order", http.StatusInternalServerError)
 		return
 	}
@@ -329,7 +456,7 @@ func (a *appState) handleCreateOrder(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
-	_ = json.NewEncoder(w).Encode(map[string]string{"id": orderID})
+	_ = json.NewEncoder(w).Encode(map[string]string{"id": orderID, "status": "pending"})
 	log.Printf("POST /orders: created order_id=%s status=pending", orderID)
 }
 

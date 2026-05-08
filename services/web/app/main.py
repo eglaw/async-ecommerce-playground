@@ -221,7 +221,7 @@ def remove_cart_item(request: Request, product_id: int):
 
 
 @app.post("/api/checkout")
-def checkout(request: Request):
+async def checkout(request: Request):
     sid = session_id(request)
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -251,9 +251,24 @@ def checkout(request: Request):
     payload = {"session_id": sid, "items": items}
 
     try:
-        r = httpx.post(f"{ORDERS_API_URL}/orders", json=payload, timeout=30.0)
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{ORDERS_API_URL}/orders", json=payload, timeout=30.0
+            )
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"orders service: {e}") from e
+
+    if r.status_code == 409:
+        try:
+            go_body = r.json()
+        except Exception:
+            go_body = None
+        if isinstance(go_body, dict):
+            raise HTTPException(status_code=409, detail=go_body)
+        raise HTTPException(
+            status_code=409,
+            detail=r.text or "insufficient stock",
+        )
 
     if r.status_code >= 400:
         raise HTTPException(
@@ -272,7 +287,10 @@ def checkout(request: Request):
                 (sid,),
             )
 
-    return {"order_id": order_id}
+    await ws_manager.broadcast_all({"type": "catalog_changed"})
+    status = data.get("status") or "pending"
+
+    return {"order_id": order_id, "status": status}
 
 
 @app.get("/api/orders/{order_id}")

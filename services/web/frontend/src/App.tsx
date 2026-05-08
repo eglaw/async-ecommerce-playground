@@ -47,6 +47,29 @@ function formatPrice(cents: number) {
   }).format(cents / 100);
 }
 
+function formatCheckoutErrorDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((x) => JSON.stringify(x)).join(", ");
+  }
+  if (detail && typeof detail === "object") {
+    const o = detail as Record<string, unknown>;
+    if (o.error === "insufficient_stock") {
+      const pid = o.product_id;
+      if (typeof pid === "number") {
+        return `Not enough stock to complete checkout (product id ${pid}). Another order may have claimed the remaining inventory. Refresh and adjust your cart.`;
+      }
+      return "Not enough stock to complete checkout. Refresh and adjust your cart.";
+    }
+  }
+  if (detail === undefined || detail === null) return fallback;
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return fallback;
+  }
+}
+
 function wsBaseUrl(): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}`;
@@ -206,9 +229,7 @@ export default function App() {
       const body = await r.json().catch(() => ({}));
       if (!r.ok) {
         setError(
-          typeof body.detail === "string"
-            ? body.detail
-            : JSON.stringify(body.detail ?? r.statusText)
+          formatCheckoutErrorDetail(body.detail, r.statusText)
         );
         return;
       }

@@ -9,6 +9,12 @@
 # virtuals
 venv
 
+# Caches
+__pycache__
+
+# binaries
+debug_bin_*
+
 # Vendors
 vendor
 
